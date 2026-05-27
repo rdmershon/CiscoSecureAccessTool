@@ -33,33 +33,55 @@ def get_access_token(client_id, client_secret):
     except requests.exceptions.RequestException as e:
         print(f"[-] Authentication failed: {e}")
         return None
-
 def query_dns_activity(token, target_domain):
     """Queries DNS activity logs using your exact working Postman URL string."""
-    # Hardcoded string pattern to ensure zero behavioral variance from Postman
-    url = f"https://api.umbrella.com/reports/v2/activity/dns?q={target_domain}&from=-30days&to=now&limit=10"
+    url = f"https://api.umbrella.com/reports/v2/activity/dns?q={target_domain}&from=-30days&to=now&limit=30"
     
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json"
     }
     
-    print(f"\n[*] Executing Exact Postman URL: {url}")
+    print(f"\n[*] Executing Reporting Query for: '{target_domain}'...")
     
     try:
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         
         raw_data = response.json()
-        data = raw_data.get("requests", [])
+        
+        # THE FIX: Umbrella API v2 stores the records in the "data" array, not "requests"
+        data = raw_data.get("data", [])
         
         if data:
-            print(f"[+] Found {len(data)} recent security event(s)/query log(s):")
+            print(f"[+] Found {len(data)} recent query log(s):")
             for record in data:
-                print(f"    - Time: {record.get('timestamp')} | Identity: {record.get('identityName')} | Action: {record.get('allowed')}")
+                # 1. Robust action/verdict extraction
+                if "verdict" in record:
+                    action = str(record["verdict"]).capitalize()
+                elif "allowed" in record:
+                    action = "Allowed" if record["allowed"] else "Blocked"
+                elif "action" in record:
+                    action = str(record["action"]).capitalize()
+                else:
+                    action = "Unknown"
+                
+                # 2. Robust identity extraction (Umbrella sometimes uses nested arrays)
+                identity = "Unknown Identity"
+                if "identityName" in record:
+                    identity = record["identityName"]
+                elif "identities" in record and isinstance(record["identities"], list) and len(record["identities"]) > 0:
+                    identity = record["identities"][0].get("label", "Unknown")
+                
+                # 3. Clean up the timestamp
+                raw_time = str(record.get("timestamp", "N/A"))
+                clean_time = raw_time.replace("T", " ")[:19] if raw_time != "N/A" else raw_time
+                
+                print(f"    - Action: {action: <7} | Identity: {identity} | Time: {clean_time}")
         else:
             print("[-] No matching domain traffic found in reporting logs for the last 30 days.")
-            print(f"    [Debug] Full Raw Response Payload: {raw_data}")
+            # Safety net: prints the root keys returned so you can see if "data" is missing
+            print(f"    [Debug] API returned these keys: {list(raw_data.keys())}")
             
     except requests.exceptions.RequestException as e:
         print(f"[-] Reporting API request failed: {e}")
