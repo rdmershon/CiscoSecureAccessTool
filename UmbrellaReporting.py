@@ -35,7 +35,7 @@ def get_access_token(client_id, client_secret):
         return None
 def query_dns_activity(token, target_domain):
     """Queries DNS activity logs using your exact working Postman URL string."""
-    url = f"https://api.umbrella.com/reports/v2/activity/dns?q={target_domain}&from=-30days&to=now&limit=30"
+    url = f"https://api.umbrella.com/reports/v2/activity/dns?domains={target_domain}&from=-30days&to=now&limit=20"
     
     headers = {
         "Authorization": f"Bearer {token}",
