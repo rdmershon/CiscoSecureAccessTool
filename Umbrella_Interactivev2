@@ -1,9 +1,4 @@
-Here is the updated script. I have added a new function called `update_destination_list()` and expanded your main menu to include it.
 
-When you select the new option, it will fetch all of your current destination lists, print them out with numbers, ask you to choose one, and then ask for the domain you'd like to add. It then sends the `POST` request to update that specific destination list in your Umbrella dashboard.
-
-```python
-#!/usr/bin/env python3
 """
 UmbrellaReporting.py
 1. Queries DNS activity logs using your exact working Postman URL configuration.
