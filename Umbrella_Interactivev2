@@ -1,9 +1,9 @@
-
+#!/usr/bin/env python3
 """
 UmbrellaReporting.py
-1. Queries DNS activity logs using your exact working Postman URL configuration.
+1. Queries DNS activity logs using Cisco Umbrella API v2.
 2. Scans all Policy Destination Lists to see if the domain is explicitly configured.
-3. Updates a selected Destination List by adding a new domain.
+3. Prompts for confirmation before adding active/searched domains to the Global Block List.
 """
 
 import sys
@@ -17,10 +17,10 @@ UMBRELLA_CLIENT_SECRET = ""
 # =============================================================
 
 ASCII_ART = r"""
-           .-^-.
-          /_/_\_\   
-         ' ' | ` `
-             j      
+            .-^-.
+           /_/_\_\   
+          ' ' | ` `
+              j     
 
  _   _ __  __ ____  ____  _____ _     _        _    
 | | | |  \/  | __ )|  _ \| ____| |   | |      / \   
@@ -55,7 +55,7 @@ def get_access_token(client_id, client_secret):
         return None
 
 def query_dns_activity(token, target_domain):
-    """Queries DNS activity logs using your exact working Postman URL string."""
+    """Queries DNS activity logs and returns True if traffic was detected."""
     url = f"https://api.umbrella.com/reports/v2/activity/dns?domains={target_domain}&from=-30days&to=now&limit=20"
     
     headers = {
@@ -70,14 +70,11 @@ def query_dns_activity(token, target_domain):
         response.raise_for_status()
         
         raw_data = response.json()
-        
-        # Umbrella API v2 stores the records in the "data" array
         data = raw_data.get("data", [])
         
         if data:
             print(f"[+] Found {len(data)} recent query log(s):")
             for record in data:
-                # 1. Robust action/verdict extraction
                 if "verdict" in record:
                     action = str(record["verdict"]).capitalize()
                 elif "allowed" in record:
@@ -87,27 +84,27 @@ def query_dns_activity(token, target_domain):
                 else:
                     action = "Unknown"
                 
-                # 2. Robust identity extraction
                 identity = "Unknown Identity"
                 if "identityName" in record:
                     identity = record["identityName"]
                 elif "identities" in record and isinstance(record["identities"], list) and len(record["identities"]) > 0:
                     identity = record["identities"][0].get("label", "Unknown")
                 
-                # 3. Clean up the timestamp
                 raw_time = str(record.get("timestamp", "N/A"))
                 clean_time = raw_time.replace("T", " ")[:19] if raw_time != "N/A" else raw_time
                 
                 print(f"    - Action: {action: <7} | Identity: {identity} | Time: {clean_time}")
+            return True
         else:
             print("[-] No matching domain traffic found in reporting logs for the last 30 days.")
-            print(f"    [Debug] API returned these keys: {list(raw_data.keys())}")
+            return False
             
     except requests.exceptions.RequestException as e:
         print(f"[-] Reporting API request failed: {e}")
+        return False
 
 def scan_destination_lists(token, target_domain):
-    """Fetches all existing destination lists and checks if the domain is inside them."""
+    """Fetches all destination lists and returns matched list entries."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json"
@@ -127,7 +124,6 @@ def scan_destination_lists(token, target_domain):
             list_name = d_list.get("name")
             list_type = d_list.get("access") 
             
-            # Fetch destinations inside this specific list
             dest_url = f"https://api.umbrella.com/policies/v2/destinationlists/{list_id}/destinations"
             dest_response = requests.get(dest_url, headers=headers)
             
@@ -148,83 +144,96 @@ def scan_destination_lists(token, target_domain):
                 print(f"    - List: '{match['name']}' (ID: {match['id']}) | Type: {match['type']} | Configured Entry: {match['entry']}")
         else:
             print("[-] Domain not found in any existing Block or Allow destination lists.")
+            
+        return matched_lists
 
     except requests.exceptions.RequestException as e:
         print(f"[-] Destination Lists API request failed: {e}")
+        return []
 
-def update_destination_list(token):
-    """Displays all destination lists and allows the user to add a domain to a selected list."""
+def get_global_blocklist_id(token):
+    """Retrieves the ID of the Global Block List."""
     headers = {
         "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Accept": "application/json"
     }
-    lists_url = "https://api.umbrella.com/policies/v2/destinationlists"
-
-    print(f"\n[*] Fetching available Destination Lists...")
+    url = "https://api.umbrella.com/policies/v2/destinationlists"
+    
     try:
-        response = requests.get(lists_url, headers=headers)
+        response = requests.get(url, headers=headers)
         response.raise_for_status()
         lists = response.json().get("data", [])
-
-        if not lists:
-            print("[-] No destination lists found for this organization.")
-            return
-
-        print("\n=== Available Destination Lists ===")
-        for index, d_list in enumerate(lists, start=1):
-            name = d_list.get("name")
-            access_type = d_list.get("access", "unknown").capitalize()
-            print(f" {index: >2}. {name} (Type: {access_type})")
-
-        choice = input("\n[?] Enter the number of the list you want to update (or 'q' to cancel): ").strip()
         
-        if choice.lower() == 'q':
-            return
-
-        try:
-            choice_idx = int(choice) - 1
-            if choice_idx < 0 or choice_idx >= len(lists):
-                print("[-] Invalid number selected.")
-                return
-            selected_list = lists[choice_idx]
-        except ValueError:
-            print("[-] Invalid input. Must be a number.")
-            return
-
-        list_id = selected_list.get("id")
-        list_name = selected_list.get("name")
-
-        new_domain = input(f"\n[?] Enter the new domain to add to '{list_name}' (e.g., example.com): ").strip()
-        
-        if not new_domain:
-            print("[-] No domain provided. Canceling operation.")
-            return
-
-        # Prepare payload for adding a destination
-        add_url = f"https://api.umbrella.com/policies/v2/destinationlists/{list_id}/destinations"
-        payload = [
-            {
-                "destination": new_domain,
-                "comment": "Added via Python API script"
-            }
-        ]
-
-        print(f"\n[*] Adding '{new_domain}' to '{list_name}'...")
-        add_response = requests.post(add_url, headers=headers, json=payload)
-
-        if add_response.status_code == 200:
-            print(f"[+] Success! '{new_domain}' has been added to '{list_name}'.")
-        else:
-            print(f"[-] Failed to update the destination list. HTTP {add_response.status_code}")
-            print(f"    Response: {add_response.text}")
-
+        for d_list in lists:
+            if d_list.get("isGlobal") and d_list.get("access") == "blocked":
+                return d_list.get("id")
+            elif d_list.get("name", "").lower() == "global block list":
+                return d_list.get("id")
+                
+        print("[-] Could not automatically locate Global Block List ID.")
+        return None
     except requests.exceptions.RequestException as e:
-        print(f"[-] API request failed: {e}")
+        print(f"[-] Failed to retrieve destination lists: {e}")
+        return None
 
+def add_to_global_blocklist(token, target_domain):
+    """Adds a target domain to the Global Block List."""
+    list_id = get_global_blocklist_id(token)
+    if not list_id:
+        print("[-] Aborting block attempt: Global Block List ID not found.")
+        return False
+        
+    url = f"https://api.umbrella.com/policies/v2/destinationlists/{list_id}/destinations"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    
+    payload = [
+        {
+            "destination": target_domain,
+            "comment": "Added via Umbrella CLI Script"
+        }
+    ]
+    
+    print(f"\n[*] Submitting POST request to add '{target_domain}' to Global Block List (ID: {list_id})...")
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        print(f"[+] Successfully added '{target_domain}' to the Global Block List!")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"[-] Failed to add domain to Global Block List: {e}")
+        return False
+
+def full_check_and_block_workflow(token, target_domain):
+    """Executes full search and asks for confirmation before blocking."""
+    has_activity = query_dns_activity(token, target_domain)
+    existing_matches = scan_destination_lists(token, target_domain)
+    
+    already_blocked = any(m['type'] == 'blocked' for m in existing_matches)
+    
+    print("\n" + "=" * 65)
+    if already_blocked:
+        print(f"[!] Notice: '{target_domain}' is ALREADY present in a block list.")
+    
+    if has_activity:
+        print(f"[!] ACTIVE TRAFFIC DETECTED for '{target_domain}'.")
+    else:
+        print(f"[*] No active traffic detected for '{target_domain}'.")
+    print("=" * 65)
+        
+    # Confirmation prompt before sending API request
+    confirm = input(f"\n[?] Do you want to add '{target_domain}' to the Global Block List? (y/N): ").strip().lower()
+    
+    if confirm in ['y', 'yes']:
+        add_to_global_blocklist(token, target_domain)
+    else:
+        print("[*] Skipped adding to Global Block List.")
 
 def main():
-    # Authenticate once before dropping into the menu loop
     print("[*] Authenticating with Cisco Umbrella API...")
     token = get_access_token(UMBRELLA_CLIENT_ID, UMBRELLA_CLIENT_SECRET)
     if not token:
@@ -234,16 +243,15 @@ def main():
         clear_screen()
         print(ASCII_ART)
         print("=" * 65)
-        print("  1. Full Search (DNS Activity & Destination Lists)")
+        print("  1. Full Search & Block Option (Activity + Lists + Block Prompt)")
         print("  2. Query DNS Activity Only")
         print("  3. Scan Destination Lists Only")
-        print("  4. Update a Destination List (Add Domain)")
-        print("  5. Exit")
+        print("  4. Exit")
         print("=" * 65)
         
-        choice = input("\n[?] Select an option (1-5): ").strip()
+        choice = input("\n[?] Select an option (1-4): ").strip()
         
-        if choice == '5':
+        if choice == '4':
             print("\n[+] Exiting. Have a rad day!\n")
             break
             
@@ -253,23 +261,15 @@ def main():
                 print("\n[-] No domain provided. Please try again.")
             else:
                 if choice == '1':
-                    query_dns_activity(token, target_domain)
-                    scan_destination_lists(token, target_domain)
+                    full_check_and_block_workflow(token, target_domain)
                 elif choice == '2':
                     query_dns_activity(token, target_domain)
                 elif choice == '3':
                     scan_destination_lists(token, target_domain)
-                    
-        elif choice == '4':
-            update_destination_list(token)
-            
         else:
-            print("\n[-] Invalid selection. Please choose a number between 1 and 5.")
+            print("\n[-] Invalid selection. Please choose 1, 2, 3, or 4.")
             
-        # Pause before looping back to the menu
         input("\nPress Enter to return to the main menu...")
 
 if __name__ == "__main__":
     main()
-
-```
