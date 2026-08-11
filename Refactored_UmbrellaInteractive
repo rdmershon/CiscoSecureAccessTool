@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""UmbrellaReporting.py: Cisco Umbrella API tool for reporting & policy management."""
+
+import os
+import re
+import sys
+import requests
+from requests.auth import HTTPBasicAuth
+
+# --- CONFIGURATION & SAFETY GUARDRAILS ---
+PROTECTED_DOMAINS = {
+    "google.com",
+    "microsoft.com",
+    "umbrella.com",
+    "cisco.com",
+    "apple.com",
+    "amazon.com",
+    "cloudflare.com",
+}
+DOMAIN_REGEX = re.compile(
+    r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
+)
+
+
+class UmbrellaClient:
+    """Handles OAuth2 authentication, auto-token refresh, and API requests."""
+
+    BASE_URL = "https://api.umbrella.com"
+
+    def __init__(self):
+        self.client_id = os.getenv("UMBRELLA_CLIENT_ID")
+        self.client_secret = os.getenv("UMBRELLA_CLIENT_SECRET")
+        self.token = None
+
+        if not self.client_id or not self.client_secret:
+            print("[!] Security Error: UMBRELLA_CLIENT_ID or SECRET not set in environment.")
+            sys.exit(1)
+
+    def authenticate(self) -> bool:
+        """Exchanges API keys for a Bearer token."""
+        url = f"{self.BASE_URL}/auth/v2/token"
+        try:
+            resp = requests.post(
+                url,
+                auth=HTTPBasicAuth(self.client_id, self.client_secret),
+                data={"grant_type": "client_credentials"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            self.token = resp.json().get("access_token")
+            return True
+        except requests.RequestException as err:
+            print(f"[-] Authentication failed: {err}")
+            return False
+
+    def request(self, method: str, endpoint: str, **kwargs) -> requests.Response:
+        """Executes API requests with automatic HTTP 401 token refresh."""
+        if not self.token and not self.authenticate():
+            raise RuntimeError("Unable to authenticate with Cisco Umbrella API.")
+
+        headers = kwargs.pop("headers", {})
+        headers.update({"Authorization": f"Bearer {self.token}", "Accept": "application/json"})
+
+        url = f"{self.BASE_URL}{endpoint}"
+        resp = requests.request(method, url, headers=headers, timeout=15, **kwargs)
+
+        # Re-authenticate and retry once if token expired
+        if resp.status_code == 401 and self.authenticate():
+            headers["Authorization"] = f"Bearer {self.token}"
+            resp = requests.request(method, url, headers=headers, timeout=15, **kwargs)
+
+        return resp
+
+
+def sanitize_domain(raw_domain: str) -> str:
+    """Strips protocols/paths and validates domain formatting."""
+    cleaned = raw_domain.strip().lower()
+    cleaned = re.sub(r"^https?://", "", cleaned).split("/")[0]
+    if not DOMAIN_REGEX.match(cleaned):
+        raise ValueError(f"Invalid domain format: '{raw_domain}'")
+    return cleaned
+
+
+def query_dns_activity(client: UmbrellaClient, domain: str) -> bool:
+    """Queries DNS activity logs for traffic on target domain."""
+    endpoint = f"/reports/v2/activity/dns?domains={domain}&from=-30days&to=now&limit=20"
+    print(f"\n[*] Executing Reporting Query for: '{domain}'...")
+    try:
+        resp = client.request("GET", endpoint)
+        resp.raise_for_status()
+        records = resp.json().get("data", [])
+
+        if not records:
+            print("[-] No matching domain traffic found in reporting logs.")
+            return False
+
+        print(f"[+] Found {len(records)} recent query log(s):")
+        for rec in records:
+            action = rec.get("verdict") or ("Allowed" if rec.get("allowed") else "Blocked") or rec.get("action") or "Unknown"
+            identity = rec.get("identityName") or rec.get("identities", [{}])[0].get("label", "Unknown")
+            time_str = str(rec.get("timestamp", "N/A")).replace("T", " ")[:19]
+            print(f"    - Action: {str(action).capitalize():<7} | Identity: {identity} | Time: {time_str}")
+        return True
+    except requests.RequestException as err:
+        print(f"[-] Reporting API request failed: {err}")
+        return False
+
+
+def scan_destination_lists(client: UmbrellaClient, domain: str) -> list:
+    """Scans all policy lists for EXACT matches of target domain."""
+    print(f"\n[*] Scanning Destination Lists for exact matches of: '{domain}'...")
+    try:
+        resp = client.request("GET", "/policies/v2/destinationlists")
+        resp.raise_for_status()
+        matched = []
+
+        for d_list in resp.json().get("data", []):
+            list_id, list_name, list_type = d_list.get("id"), d_list.get("name"), d_list.get("access")
+            dest_resp = client.request("GET", f"/policies/v2/destinationlists/{list_id}/destinations")
+
+            if dest_resp.status_code == 200:
+                for dest in dest_resp.json().get("data", []):
+                    # Fixed: Exact string equality replaces loose substring match
+                    if dest.get("destination", "").strip().lower() == domain:
+                        matched.append({"name": list_name, "id": list_id, "type": list_type, "entry": dest.get("destination")})
+
+        if matched:
+            print("[!] Domain configuration found in destination lists:")
+            for m in matched:
+                print(f"    - List: '{m['name']}' (ID: {m['id']}) | Type: {m['type']} | Configured: {m['entry']}")
+        else:
+            print("[-] Domain not found in any existing destination lists.")
+
+        return matched
+    except requests.RequestException as err:
+        print(f"[-] Destination Lists API request failed: {err}")
+        return []
+
+
+def add_to_global_blocklist(client: UmbrellaClient, domain: str) -> bool:
+    """Adds domain to Global Block List with safety checks."""
+    if domain in PROTECTED_DOMAINS:
+        print(f"[!] SAFETY GUARDRAIL: '{domain}' is protected and cannot be blocked!")
+        return False
+
+    try:
+        resp = client.request("GET", "/policies/v2/destinationlists")
+        resp.raise_for_status()
+        list_id = next(
+            (d["id"] for d in resp.json().get("data", [])
+             if d.get("isGlobal") and d.get("access") == "blocked" or d.get("name", "").lower() == "global block list"),
+            None
+        )
+
+        if not list_id:
+            print("[-] Aborting: Global Block List ID not found.")
+            return False
+
+        payload = [{"destination": domain, "comment": "Added via Umbrella CLI Script"}]
+        post_resp = client.request("POST", f"/policies/v2/destinationlists/{list_id}/destinations", json=payload)
+        post_resp.raise_for_status()
+        print(f"[+] Successfully added '{domain}' to Global Block List (ID: {list_id}).")
+        return True
+    except requests.RequestException as err:
+        print(f"[-] Failed to block domain: {err}")
+        return False
+
+
+def full_check_and_block_workflow(client: UmbrellaClient, domain: str):
+    """Executes full search and prompts for confirmation."""
+    has_activity = query_dns_activity(client, domain)
+    matches = scan_destination_lists(client, domain)
+    already_blocked = any(m["type"] == "blocked" for m in matches)
+
+    print("\n" + "=" * 65)
+    if already_blocked:
+        print(f"[!] Notice: '{domain}' is ALREADY present in a block list.")
+    print(f"[{'!' if has_activity else '*'}] {'ACTIVE TRAFFIC DETECTED' if has_activity else 'No active traffic detected'} for '{domain}'.")
+    print("=" * 65)
+
+    confirm = input(f"\n[?] Add '{domain}' to Global Block List? (y/N): ").strip().lower()
+    if confirm in ["y", "yes"]:
+        add_to_global_blocklist(client, domain)
+    else:
+        print("[*] Skipped adding to Global Block List.")
+
+
+def main():
+    client = UmbrellaClient()
+    if not client.authenticate():
+        return
+
+    while True:
+        os.system("cls" if os.name == "nt" else "clear")
+        print("=" * 65 + "\n  1. Full Search & Block\n  2. Query DNS Activity Only\n  3. Scan Destination Lists Only\n  4. Exit\n" + "=" * 65)
+        choice = input("\n[?] Select an option (1-4): ").strip()
+
+        if choice == "4":
+            print("\n[+] Exiting. Have a great day!\n")
+            break
+        if choice in ["1", "2", "3"]:
+            raw_input = input("\n[?] Enter domain (e.g., google.com): ")
+            try:
+                target_domain = sanitize_domain(raw_input)
+            except ValueError as err:
+                print(f"[-] {err}")
+                input("\nPress Enter to return to menu...")
+                continue
+
+            if choice == "1":
+                full_check_and_block_workflow(client, target_domain)
+            elif choice == "2":
+                query_dns_activity(client, target_domain)
+            elif choice == "3":
+                scan_destination_lists(client, target_domain)
+        else:
+            print("\n[-] Invalid selection.")
+
+        input("\nPress Enter to return to main menu...")
+
+
+if __name__ == "__main__":
+    main()
